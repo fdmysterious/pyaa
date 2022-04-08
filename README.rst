@@ -22,6 +22,7 @@ Example usage: i2c master
 =========================
 
 .. code:: python
+
     from pyaa import (
         list_probes,
 
