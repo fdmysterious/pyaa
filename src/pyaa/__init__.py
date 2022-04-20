@@ -9,10 +9,12 @@
 
 import logging
 import contextlib
+import asyncio
 
 from array       import array
 from dataclasses import dataclass
-from threading   import Event, RLock
+from threading   import Event, RLock, Thread
+from queue       import Queue
 
 from aardvark_py import (
     AA_PORT_NOT_FREE,
@@ -69,7 +71,8 @@ from aardvark_py import (
 # │ Various constants                      │
 # └────────────────────────────────────────┘
 
-MAX_I2C_READ_SIZE=65535 # From aardvark manual
+MAX_I2C_READ_SIZE     = 65535 # From aardvark manual
+ASYNC_POLL_TIMEOUT_MS = 100   # This value must be a balance between desired reactivity and resulting CPU load
 
 
 # ┌────────────────────────────────────────┐
@@ -147,30 +150,62 @@ class PyAA_Config:
             int(self.i2c_enabled) * AA_CONFIG_GPIO_I2C
         )
 
+@dataclass
+class PyAA_Async_Event:
+    i2c_read:  bool
+    i2c_write: bool
+    spi:       bool
+
+    @classmethod
+    def from_byte(cls, v: int):
+        return cls(
+            i2c_read  = bool(v & AA_ASYNC_I2C_READ ),
+            i2c_write = bool(v & AA_ASYNC_I2C_WRITE),
+            spi       = bool(v & AA_ASYNC_SPI      )
+        )
+
+class PyAA_Probe_Driver:
+    def __init__(self, probe: "PyAA_Probe"):
+        self.probe = probe
+
+    def _event_callback(self, ev: PyAA_Async_Event):
+        pass # User implemented
+
 
 class PyAA_Probe:
     def __init__(self, port: int):
-        self.port       = port
-        self.handle     = None
+        self.port                 = port
+        self.handle               = None
 
-        self.version    = None
-        self.features   = None
+        self.version              = None
+        self.features             = None
 
-        self.opened     = Event()
+        self.opened               = Event()
 
         # Drivers
-        self.i2c_driver = None
+        self.i2c_driver           = None
+        self.spi_driver           = None
 
-        # Worker thread and locks
-        self.w_lock     = RLock()
-        self.r_lock     = RLock()
+        self.i2c_lock             = RLock()
+        self.spi_lock             = RLock()
+
+        # Worker thread   and locks
+        self.lock                 = RLock() # Write lock
+
+        # RX consumers and worker
+        # FIXME # Ugly stuff, they should be a better way, using threading.Condition or something like
+        # that.
+        self.rx_consumers         = set()
+        self.rx_consumers_lock    = RLock()
+        self.rx_consumers_present = Event()
+        self.rx_worker            = Thread(target=self.__rx_worker, daemon=True)
 
     # ───────────── Open / Close ───────────── #
 
     def open(self):
         if not self.opened.is_set():
+            # Open and set opened flag
             self.handle, infos_ext = aa_open_ext(self.port)
-            
             if self.handle < 0:
                 raise PyAA_Probe_Error(self.handle, "Unable to open device")
 
@@ -179,29 +214,36 @@ class PyAA_Probe:
             # Parse infos_ext
             self.features = PyAA_Features.from_byte(infos_ext.features)
 
+            # Start worker thread
+            self.rx_worker.start()
+
 
     def close(self):
+        print("Close probe")
         if self.opened.is_set():
-            aa_close(self.handle)
-            self.opened.clear()
+            with self.lock:
+                aa_close(self.handle)
+                self.opened.clear()
+
+            self.rx_worker.join(timeout=10)
 
 
     # ──────────── Config get/set ──────────── #
 
     def config_get(self):
-        with self.r_lock:
+        with self.lock:
             return PyAA_Config.from_byte(aa_configure(self.handle, AA_CONFIG_QUERY))
 
 
     def config_set(self, conf: PyAA_Config):
-        with self.w_lock:
+        with self.lock:
             ret = aa_configure(self.handle, conf.byte())
             if ret < 0: raise PyAA_Probe_Error(ret, "Unable to set config")
 
     # ────── Target power enable/disable ───── #
     
     def target_power_enable(self, v: bool):
-        with self.w_lock:
+        with self.lock:
             ret = aa_target_power(self.handle, AA_TARGET_POWER_BOTH if v else AA_TARGET_POWER_NONE)
             if ret < 0: raise PyAA_Probe_Error(ret, "Unable to set Target power")
 
@@ -216,11 +258,42 @@ class PyAA_Probe:
     def __exit__(self, type, value, traceback):
         self.close()
 
+    # ───────────── Worker thread ──────────── #
+    
+    def __rx_worker(self):
+        print("Start rx worker")
+        while self.opened.is_set():
+            print("RX loop")
+            self.rx_consumers_present.wait()
+            with self.rx_consumers_lock:
+                if self.rx_consumers: # RX consumers not empty
+                    with self.lock:
+                        stat = aa_async_poll(self.handle, ASYNC_POLL_TIMEOUT_MS)
+
+                        if stat != AA_ASYNC_NO_DATA:
+                            ev = PyAA_Async_Event.from_byte(stat)
+                            for consumer in self.rx_consumers: consumer._event_callback(ev)
+
+                else:
+                    self.rx_consumers_present.clear() # No more consumers, clear flag to wait for new ones.
+
+        print("Stop rx worker")
+
+    def rx_consumer_add(self, consumer):
+        with self.rx_consumers_lock:
+            self.rx_consumers.add(consumer)
+            self.rx_consumers_present.set()
+
+    def rx_consumer_discard(self, consumer):
+        with self.rx_consumers_lock:
+            self.rx_consumers.discard(consumer)
+            # self.rx_consumers_present is cleared by worker thread
+
 # ┌────────────────────────────────────────┐
 # │ Master I2C driver                      │
 # └────────────────────────────────────────┘
 
-class PyAA_I2C_Master_Driver:
+class PyAA_I2C_Master_Driver(PyAA_Probe_Driver):
     def __init__(self,
         probe: PyAA_Probe,
         pullups_enabled: bool = None,
@@ -231,8 +304,8 @@ class PyAA_I2C_Master_Driver:
         When values are none, the current config
         is untouched.
         """
+        super().__init__(probe)
 
-        self.probe           = probe
         self.pullups_enabled = pullups_enabled
         self.bitrate_khz     = bitrate_khz
         self.timeout_ms      = timeout_ms
@@ -262,9 +335,10 @@ class PyAA_I2C_Master_Driver:
             raise RuntimeError("I2C is not supported by probe")
 
         # Attach the driver to the probe
-        if self.probe.i2c_driver is not None:
-            raise RuntimeError("An i2c driver is already attached to the probe")
-        self.probe.i2c_driver = self
+        with self.probe.i2c_lock:
+            if self.probe.i2c_driver is not None:
+                raise RuntimeError("An i2c driver is already attached to the probe")
+            self.probe.i2c_driver = self
 
         # Update config
         conf = self.probe.config_get()
@@ -272,7 +346,7 @@ class PyAA_I2C_Master_Driver:
         self.probe.config_set(conf)
 
         # Set I2C as master, and set parameters
-        with self.probe.w_lock:
+        with self.probe.lock:
             ret = aa_i2c_slave_disable(self.probe.handle)#
             if ret < 0: raise PyAA_Probe_Error(ret, "Cannot set I2C probe as Master")
 
@@ -289,12 +363,13 @@ class PyAA_I2C_Master_Driver:
                 if ret < 0: raise PyAA_Probe_Error(ret, "Cannot set I2C bus timeout")
 
     def dettach(self):
-        self.probe.i2c_driver = None
+        with self.probe.i2c_lock:
+            self.probe.i2c_driver = None
 
     # ───────────── Write / Read ───────────── #
 
     def write(self, slave_addr: int, data: bytes):
-        with self.probe.w_lock:
+        with self.probe.lock:
             ret, num_written = aa_i2c_write_ext(self.probe.handle, slave_addr, 0, array("B", data))
             if ret < 0:          raise PyAA_Probe_Error(ret, "Unable to write I2C master data")
             if num_written == 0: raise RuntimeError("Written 0 bytes")
@@ -302,13 +377,18 @@ class PyAA_I2C_Master_Driver:
         return num_written
 
     def read(self, slave_addr: int):
-        with self.probe.r_lock:
+        with self.probe.lock:
             ret, data_in, num_read = aa_i2c_read_ext(self.probe.handle, slave_addr, 0, MAX_I2C_READ_SIZE)
-
             if ret < 0: raise PyAA_Probe_Error(ret, "Unable to read I2C master data for slave 0x{slave_addr:02X}")
             #if num_read == 0: raise RuntimeError("Read 0 bytes")
         
         return bytes(data_in)
+
+    # ──────────── Process events ──────────── #
+
+    def _event_callback(self, ev: PyAA_Async_Event):
+        if ev.i2c_read or ev.i2c_write:
+            pass # TODO # Warning message that i2c_read and i2c_write events should not happen in master mode
 
     # ──────────── Context manager ─────────── #
     
@@ -336,6 +416,8 @@ class PyAA_I2C_Slave_Driver:
         self.pullups_enabled = pullups_enabled
         self.timeout_ms      = timeout_ms
 
+        self.rqueue          = Queue() # Read queue
+
     # ─────────── Attach / Dettach ─────────── #
     
     def attach(self):
@@ -348,9 +430,10 @@ class PyAA_I2C_Slave_Driver:
             raise RuntimeError("I2C is not supported by probe")
 
         # Attach the driver to the probe
-        if self.probe.i2c_driver is not None:
-            raise RuntimeError("An i2c driver is already attached to the probe")
-        self.probe.i2c_driver = self
+        with self.probe.i2c_lock:
+            if self.probe.i2c_driver is not None:
+                raise RuntimeError("An i2c driver is already attached to the probe")
+            self.probe.i2c_driver = self
 
         # Update config
         conf = self.probe.config_get()
@@ -358,7 +441,7 @@ class PyAA_I2C_Slave_Driver:
         self.probe.config_set(conf)
 
         # Set I2C as slave, and set parameters
-        with self.probe.w_lock:
+        with self.probe.lock:
             ret = aa_i2c_slave_enable(self.probe.handle, self.addr | 0x80, 0,0)
             if ret < 0: raise PyAA_Probe_Error(ret, "Unable to set probe as I2C slave")
 
@@ -371,49 +454,85 @@ class PyAA_I2C_Slave_Driver:
                 if ret < 0: raise PyAA_Probe_Error(ret, "Cannot set I2C bus timeout")
 
     def dettach(self):
-        self.probe.i2c_driver = None
+        with self.probe.i2c_lock:
+            self.probe.i2c_driver = None
 
 
     # ───────────── Write / Read  ──────────── #
 
     def read(self, timeout_ms=None):
-        # Poll for read event
-        # FIXME # Dirty skip of unwanted values, may breaks timeout stuff. Better event loop handling required!
-        status = None
-        while status != AA_ASYNC_I2C_READ:
-            status = aa_async_poll(self.probe.handle, timeout_ms or -1)
-            
-            if status == AA_ASYNC_NO_DATA:
+        ## Poll for read event
+        ## FIXME # Dirty skip of unwanted values, may breaks timeout stuff. Better event loop handling required!
+        #status = None
+        #while status != AA_ASYNC_I2C_READ:
+        #    status = aa_async_poll(self.probe.handle, timeout_ms or -1)
+        #    
+        #    if status == AA_ASYNC_NO_DATA:
+        #        raise TimeoutError("Timeout waiting for I2C data")
+
+        ## Read data
+        #ret, addr, data_in, num_read = aa_i2c_slave_read_ext(self.probe.handle, MAX_I2C_READ_SIZE)
+        #if ret < 0: raise PyAA_Probe_Error(ret, "Cannot read from I2C slave")
+        ##if num_read == 0: raise RuntimeError("Read 0 bytes")
+
+        #return (addr, bytes(data_in))
+        self.probe.rx_consumer_add(self)
+        try:
+            item = self.rqueue.get(timeout=timeout_ms/1000 if timeout_ms is not None else None)
+            if item is None:
                 raise TimeoutError("Timeout waiting for I2C data")
 
-        # Read data
-        ret, addr, data_in, num_read = aa_i2c_slave_read_ext(self.probe.handle, MAX_I2C_READ_SIZE)
-        if ret < 0: raise PyAA_Probe_Error(ret, "Cannot read from I2C slave")
-        #if num_read == 0: raise RuntimeError("Read 0 bytes")
+            elif isinstance(item, Exception):
+                raise item
 
-        return (addr, bytes(data_in))
-
+            else:
+                return item # addr, data
+        finally:
+            self.probe.rx_consumer_discard(self)
 
     def response_set(self, resp: bytes):
-        ret = aa_i2c_slave_set_response(self.probe.handle, array('B', resp))
-        if ret < 0: raise PyAA_Probe_Error(ret, "Cannot set I2C slave response")
+        with self.lock:
+            ret = aa_i2c_slave_set_response(self.probe.handle, array('B', resp))
+            if ret < 0: raise PyAA_Probe_Error(ret, "Cannot set I2C slave response")
 
-    def write_wait(self, timeout_ms=None):
-        """
-        May disappear in the future, quick workaround!
-        """
-        # Poll for write event
-        # FIXME # Dirty skip of unwanted values, may breaks timeout stuff. Better event loop handling required!
-        status = None
-        while status != AA_ASYNC_I2C_WRITE:
-            status = aa_async_poll(self.probe.handle, timeout_ms or -1)
-            
-            if status == AA_ASYNC_NO_DATA:
-                raise TimeoutError("Timeout waiting for slave I2C write")
+    # TODO #
+    #def write_wait(self, timeout_ms=None):
+    #    """
+    #    May disappear in the future, quick workaround!
+    #    """
+    #    # Poll for write event
+    #    # FIXME # Dirty skip of unwanted values, may breaks timeout stuff. Better event loop handling required!
+    #    status = None
+    #    while status != AA_ASYNC_I2C_WRITE:
+    #        status = aa_async_poll(self.probe.handle, timeout_ms or -1)
+    #        
+    #        if status == AA_ASYNC_NO_DATA:
+    #            raise TimeoutError("Timeout waiting for slave I2C write")
 
-        status, num_written = aa_i2c_write_stats_ext(self.probe.handle)
-        if status < 0: raise PyAA_Probe_Error(status, "Failed slave I2C write")
-        return num_written
+    #    status, num_written = aa_i2c_write_stats_ext(self.probe.handle)
+    #    if status < 0: raise PyAA_Probe_Error(status, "Failed slave I2C write")
+    #    return num_written
+
+    # ───────── Process async events ───────── #
+
+    def _event_callback(self, ev: PyAA_Async_Event):
+        if ev.i2c_read:
+            ret, addr, data_in, num_read = aa_i2c_slave_read_ext(self.probe.handle, MAX_I2C_READ_SIZE)
+            #if ret < 0: raise PyAA_Probe_Error(ret, "Cannot read from I2C slave")
+            if ret < 0:
+                self.rqueue.put(PyAA_Probe_Error(ret, "Cannot read from I2C slave"))
+                # TODO # Print traceback?
+
+            self.rqueue.put((addr, bytes(data_in),))
+
+        if ev.i2c_write:
+            pass
+            #status, num_written = aa_i2c_write_stats_ext(self.probe.handle)
+            #if status < 0:
+            #    self.rqueue.put(PyAA_Probe_Error(ret, "Failed slave I2C write"))
+            #    # TODO # Print traceback?
+
+            # TODO # Write queue stuff
 
 
     # ───────── Context manager stuff ──────── #
