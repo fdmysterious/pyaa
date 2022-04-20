@@ -222,8 +222,9 @@ class PyAA_Probe:
         print("Close probe")
         if self.opened.is_set():
             with self.lock:
-                aa_close(self.handle)
                 self.opened.clear()
+                self.rx_consumers_present.set() # To unlock the waiting condition if any
+                aa_close(self.handle)
 
             self.rx_worker.join(timeout=10)
 
@@ -264,17 +265,19 @@ class PyAA_Probe:
         print("Start rx worker")
         while self.opened.is_set():
             self.rx_consumers_present.wait()
-            with self.rx_consumers_lock:
-                if self.rx_consumers: # RX consumers not empty
-                    with self.lock:
-                        stat = aa_async_poll(self.handle, ASYNC_POLL_TIMEOUT_MS)
 
-                        if stat != AA_ASYNC_NO_DATA:
-                            ev = PyAA_Async_Event.from_byte(stat)
-                            for consumer in self.rx_consumers: consumer._event_callback(ev)
+            if self.opened.is_set():
+                with self.rx_consumers_lock:
+                    if self.rx_consumers: # RX consumers not empty
+                        with self.lock:
+                            stat = aa_async_poll(self.handle, ASYNC_POLL_TIMEOUT_MS)
 
-                else:
-                    self.rx_consumers_present.clear() # No more consumers, clear flag to wait for new ones.
+                            if stat != AA_ASYNC_NO_DATA:
+                                ev = PyAA_Async_Event.from_byte(stat)
+                                for consumer in self.rx_consumers: consumer._event_callback(ev)
+
+                    else:
+                        self.rx_consumers_present.clear() # No more consumers, clear flag to wait for new ones.
 
         print("Stop rx worker")
 
