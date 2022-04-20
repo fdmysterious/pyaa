@@ -263,7 +263,6 @@ class PyAA_Probe:
     def __rx_worker(self):
         print("Start rx worker")
         while self.opened.is_set():
-            print("RX loop")
             self.rx_consumers_present.wait()
             with self.rx_consumers_lock:
                 if self.rx_consumers: # RX consumers not empty
