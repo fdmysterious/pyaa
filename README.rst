@@ -18,6 +18,15 @@ Limitations
 - Missing SPI support (yet)
 - Missing GPIO support (yet)
 
+Installation
+============
+
+Install using pip:
+
+.. code:: python
+
+    pip install git+https://github.com/fdmysterious/pyaa
+
 Example usage: i2c master
 =========================
 
