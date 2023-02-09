@@ -35,6 +35,13 @@ from aardvark_py import (
     AA_I2C_PULLUP_BOTH,
     AA_I2C_PULLUP_QUERY,
 
+    AA_SPI_POL_RISING_FALLING,
+    AA_SPI_POL_FALLING_RISING,
+    AA_SPI_PHASE_SAMPLE_SETUP,
+    AA_SPI_PHASE_SETUP_SAMPLE,
+    AA_SPI_BITORDER_MSB,
+    AA_SPI_BITORDER_LSB,
+
     AA_TARGET_POWER_NONE,
     AA_TARGET_POWER_BOTH,
     AA_TARGET_POWER_QUERY,
@@ -72,6 +79,7 @@ from aardvark_py import (
 # └────────────────────────────────────────┘
 
 MAX_I2C_READ_SIZE     = 65535 # From aardvark manual
+MAX_SPI_READ_SIZE     = 65535 # Default random value lol
 ASYNC_POLL_TIMEOUT_MS = 100   # This value must be a balance between desired reactivity and resulting CPU load
 
 
@@ -536,6 +544,152 @@ class PyAA_I2C_Slave_Driver:
 
             # TODO # Write queue stuff
 
+
+    # ───────── Context manager stuff ──────── #
+    
+    def __enter__(self):
+        self.attach()
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.dettach()
+
+# ┌────────────────────────────────────────┐
+# │ SPI Enums and stuff                    │
+# └────────────────────────────────────────┘
+
+class PyAA_SPI_BitOrder(IntEnum):
+    LSB = AA_SPI_BITORDER_LSB
+    MSB = AA_SPI_BITORDER_MSB
+
+class PyAA_SPI_Polarity(IntEnum):
+    RisingFalling = AA_SPI_POL_RISING_FALLING
+    FallingRising = AA_SPI_POL_FALLING_RISING
+
+class PyAA_SPI_Phase(IntEnum):
+    SampleSetup   = AA_SPI_PHASE_SAMPLE_SETUP
+    SetupSample   = AA_SPI_PHASE_SETUP_SAMPLE
+
+
+# ┌────────────────────────────────────────┐
+# │ Slave SPI driver                       │
+# └────────────────────────────────────────┘
+
+class PyAA_SPI_Slave_Driver:
+    def __init__(self,
+        probe: PyAA_Probe,
+        polarity: PyAA_SPI_Polarity,
+        phase: PyAA_SPI_Phase,
+        bitorder: PyAA_SPI_BitOrder
+    ):
+        self.probe           = probe
+        self.polarity        = polarity
+        self.phase           = phase
+
+        self.rqueue          = Queue() # Read queue
+
+    # ─────────── Attach / Dettach ─────────── #
+    
+    def attach(self):
+        # Ensure that the probe is opened
+        if not self.probe.opened.is_set():
+            raise RuntimeError("Aardvark probe must be opened prior to attaching the driver")
+
+        # Check features
+        if not self.probe.features.spi:
+            raise RuntimeError("SPI is not supported by probe")
+
+        # Attach the driver to the probe
+        with self.probe.spi_lock:
+            if self.probe.spi_driver is not None:
+                raise RuntimeError("An spi driver is already attached to the probe")
+            self.probe.spi_driver = self
+
+        # Update config
+        conf = self.probe.config_get()
+        conf.spi_enabled = True
+        self.probe.config_set(conf)
+
+        # Set SPI as slave, and set parameters
+        with self.probe.lock:
+            ret = aa_spi_slave_enable(self.probe.handle)
+            if ret < 0: raise PyAA_Probe_Error(ret, "Unable to set probe as SPI slave")
+
+            ret = aa_spi_configure(self.polarity.value, self.phase.value, self.bitorder.value)
+            if ret < 0: raise PyAA_Probe_Error(ret, "Unable to configure SPI slave parameters")
+
+
+    def dettach(self):
+        with self.probe.spi_lock:
+            self.probe.spi_driver = None
+
+
+    # ───────────── Write / Read  ──────────── #
+
+    def read(self, timeout_ms=None):
+        ## Poll for read event
+        ## FIXME # Dirty skip of unwanted values, may breaks timeout stuff. Better event loop handling required!
+        #status = None
+        #while status != AA_ASYNC_I2C_READ:
+        #    status = aa_async_poll(self.probe.handle, timeout_ms or -1)
+        #    
+        #    if status == AA_ASYNC_NO_DATA:
+        #        raise TimeoutError("Timeout waiting for I2C data")
+
+        ## Read data
+        #ret, addr, data_in, num_read = aa_i2c_slave_read_ext(self.probe.handle, MAX_I2C_READ_SIZE)
+        #if ret < 0: raise PyAA_Probe_Error(ret, "Cannot read from I2C slave")
+        ##if num_read == 0: raise RuntimeError("Read 0 bytes")
+
+        #return (addr, bytes(data_in))
+        self.probe.rx_consumer_add(self)
+        try:
+            item = self.rqueue.get(timeout=timeout_ms/1000 if timeout_ms is not None else None)
+            if item is None:
+                raise TimeoutError("Timeout waiting for SPI data")
+
+            elif isinstance(item, Exception):
+                raise item
+
+            else:
+                return item # addr, data
+        finally:
+            self.probe.rx_consumer_discard(self)
+
+    def response_set(self, resp: bytes):
+        with self.lock:
+            ret = aa_spi_slave_set_response(self.probe.handle, array('B', resp))
+            if ret < 0: raise PyAA_Probe_Error(ret, "Cannot set SPI slave response")
+
+    # TODO #
+    #def write_wait(self, timeout_ms=None):
+    #    """
+    #    May disappear in the future, quick workaround!
+    #    """
+    #    # Poll for write event
+    #    # FIXME # Dirty skip of unwanted values, may breaks timeout stuff. Better event loop handling required!
+    #    status = None
+    #    while status != AA_ASYNC_I2C_WRITE:
+    #        status = aa_async_poll(self.probe.handle, timeout_ms or -1)
+    #        
+    #        if status == AA_ASYNC_NO_DATA:
+    #            raise TimeoutError("Timeout waiting for slave I2C write")
+
+    #    status, num_written = aa_i2c_write_stats_ext(self.probe.handle)
+    #    if status < 0: raise PyAA_Probe_Error(status, "Failed slave I2C write")
+    #    return num_written
+
+    # ───────── Process async events ───────── #
+
+    def _event_callback(self, ev: PyAA_Async_Event):
+        if ev.spi:
+            ret, data_in = aa_i2c_slave_read_ext(self.probe.handle, MAX_SPI_READ_SIZE)
+            #if ret < 0: raise PyAA_Probe_Error(ret, "Cannot read from I2C slave")
+            if ret < 0:
+                self.rqueue.put(PyAA_Probe_Error(ret, "Cannot read from SPI slave"))
+                # TODO # Print traceback?
+
+            self.rqueue.put((addr, bytes(data_in),))
 
     # ───────── Context manager stuff ──────── #
     
