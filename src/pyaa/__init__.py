@@ -67,6 +67,7 @@ from aardvark_py import (
     aa_i2c_read,
     aa_i2c_write,
     aa_i2c_write_ext,
+    aa_i2c_slave_write_stats_ext,
     
     aa_i2c_slave_enable,
     aa_i2c_slave_disable,
@@ -555,8 +556,7 @@ class PyAA_I2C_Slave_Driver:
             self.rqueue.put((addr, bytes(data_in),))
 
         if ev.i2c_write:
-            pass
-            #status, num_written = aa_i2c_write_stats_ext(self.probe.handle)
+            status, num_written = aa_i2c_slave_write_stats_ext(self.probe.handle)
             #if status < 0:
             #    self.rqueue.put(PyAA_Probe_Error(ret, "Failed slave I2C write"))
             #    # TODO # Print traceback?
